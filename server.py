@@ -19,9 +19,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# precise imports
+from functools import lru_cache
+
 # Initialize Groq client
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
+# Cache system prompt to avoid disk I/O on every turn
+@lru_cache(maxsize=1)
 def get_system_prompt():
     system_prompt_file = "system_prompt.txt"
     if os.path.exists(system_prompt_file):
@@ -42,16 +47,7 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
     current_generation_task = None
 
     try:
-        # 1. Send Initial Greeting
-        initial_greeting = "Hey there, Am I speaking with Marcus?"
-        await websocket.send_json({
-            "response_type": "response",
-            "response_id": 0,
-            "content": initial_greeting,
-            "content_complete": True,
-            "end_call": False
-        })
-
+        # Wait for user input (no initial greeting)
         async for data in websocket.iter_json():
             interaction_type = data.get("interaction_type")
             
@@ -107,8 +103,8 @@ async def handle_response(websocket: WebSocket, data: dict):
             model="llama-3.1-8b-instant", 
             messages=messages,
             stream=True,
-            temperature=0.4, 
-            max_tokens=150,
+            temperature=0.2, 
+            max_tokens=80,
         )
         
         async for chunk in completion:
