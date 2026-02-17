@@ -11,7 +11,6 @@ load_dotenv()
 
 app = FastAPI()
 
-# Add CORS to allow connections from Retell servers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,16 +20,14 @@ app.add_middleware(
 )
 
 # Initialize Groq client
-# Ensure GROQ_API_KEY is set in your Railway Variables
 groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Function to load system prompt safely
 def get_system_prompt():
     system_prompt_file = "system_prompt.txt"
     if os.path.exists(system_prompt_file):
         with open(system_prompt_file, "r") as f:
             return f.read().strip()
-    return "You are a helpful assistant." # Fallback
+    return "You are a helpful assistant."
 
 @app.get("/")
 async def health_check():
@@ -40,12 +37,13 @@ async def health_check():
 async def websocket_endpoint(websocket: WebSocket, call_id: str):
     await websocket.accept()
     print(f"Accepted connection for call_id: {call_id}")
+    
+    # Track the current generation task so we can cancel it if needed
+    current_generation_task = None
 
     try:
         # 1. Send Initial Greeting
-        # The initial greeting is hardcoded here to ensure low latency on the first turn
         initial_greeting = "Hey there, Am I speaking with Marcus?"
-        
         await websocket.send_json({
             "response_type": "response",
             "response_id": 0,
@@ -57,81 +55,86 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
         async for data in websocket.iter_json():
             interaction_type = data.get("interaction_type")
             
-            if interaction_type == "ping_pong":
-                timestamp = data.get("timestamp")
+            # --- CRITICAL FIX: CONCURRENCY HANDLING ---
+            # If a new response is required, we MUST cancel any ongoing generation.
+            # This prevents the "Stutter Effect" where the AI replies to old audio fragments.
+            if interaction_type == "response_required":
+                if current_generation_task and not current_generation_task.done():
+                    print("Cancelling previous generation task...")
+                    current_generation_task.cancel()
+                
+                # Create a new task for this response and track it
+                current_generation_task = asyncio.create_task(
+                    handle_response(websocket, data)
+                )
+
+            elif interaction_type == "ping_pong":
                 await websocket.send_json({
                     "response_type": "ping_pong",
-                    "timestamp": timestamp
+                    "timestamp": data.get("timestamp")
                 })
-                continue
-            
-            if interaction_type == "update_only":
-                continue
-            
-            if interaction_type == "response_required":
-                response_id = data.get("response_id")
-                transcript = data.get("transcript", [])
                 
-                # Load the latest system prompt
-                current_system_prompt = get_system_prompt()
-                
-                # Construct messages for Groq
-                messages = [{"role": "system", "content": current_system_prompt}]
-                
-                # --- CRITICAL FIX: Increased Context Window ---
-                # We now keep the last 20 turns instead of 6. 
-                # Llama 3.1 8B is fast enough to handle this, and it prevents the agent
-                # from "forgetting" that the user already answered "Homeowner".
-                recent_transcript = transcript[-20:] if len(transcript) > 20 else transcript
-                
-                # Map Retell transcript to Groq message format
-                for turn in recent_transcript:
-                    role = "assistant" if turn["role"] == "agent" else "user"
-                    messages.append({"role": role, "content": turn["content"]})
-                
-                print(f"Generating response for ID {response_id}...")
-                
-                try:
-                    # Call Groq API with streaming
-                    completion = await groq_client.chat.completions.create(
-                        model="llama-3.1-8b-instant", 
-                        messages=messages,
-                        stream=True,
-                        # --- OPTIMIZATION: Lower Temperature ---
-                        # 0.4 keeps it natural but prevents it from drifting off-script
-                        temperature=0.4, 
-                        max_tokens=150,
-                        stop=None 
-                    )
-                    
-                    # Stream chunks back to Retell
-                    full_response = ""
-                    async for chunk in completion:
-                        content = chunk.choices[0].delta.content
-                        if content:
-                            full_response += content
-                            await websocket.send_json({
-                                "response_type": "response",
-                                "response_id": response_id,
-                                "content": content,
-                                "content_complete": False,
-                                "end_call": False
-                            })
-                    
-                    # Signal completion
-                    await websocket.send_json({
-                        "response_type": "response",
-                        "response_id": response_id,
-                        "content": "",
-                        "content_complete": True,
-                        "end_call": False
-                    })
-                    print(f"Response complete: {full_response}")
-                except Exception as e:
-                    print(f"Error calling Groq API: {e}")
-                    continue
-
     except WebSocketDisconnect:
         print(f"Client disconnected for call {call_id}")
     except Exception as e:
         print(f"Error processing call {call_id}: {e}")
+
+async def handle_response(websocket: WebSocket, data: dict):
+    """
+    Handles the LLM generation in a separate task.
+    This allows the main loop to listen for new interruptions constantly.
+    """
+    response_id = data.get("response_id")
+    transcript = data.get("transcript", [])
+    
+    # Load system prompt
+    system_prompt = get_system_prompt()
+    
+    # Construct messages
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Use larger context window (20 turns)
+    recent_transcript = transcript[-20:] if len(transcript) > 20 else transcript
+    
+    for turn in recent_transcript:
+        role = "assistant" if turn["role"] == "agent" else "user"
+        messages.append({"role": role, "content": turn["content"]})
+    
+    print(f"Generating response for ID {response_id}...")
+
+    try:
+        completion = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant", 
+            messages=messages,
+            stream=True,
+            temperature=0.4, 
+            max_tokens=150,
+        )
+        
+        async for chunk in completion:
+            content = chunk.choices[0].delta.content
+            if content:
+                await websocket.send_json({
+                    "response_type": "response",
+                    "response_id": response_id,
+                    "content": content,
+                    "content_complete": False,
+                    "end_call": False
+                })
+        
+        # Signal completion
+        await websocket.send_json({
+            "response_type": "response",
+            "response_id": response_id,
+            "content": "",
+            "content_complete": True,
+            "end_call": False
+        })
+        print(f"Response complete for ID {response_id}")
+
+    except asyncio.CancelledError:
+        print(f"Generation for ID {response_id} was cancelled by new input.")
+        # Important: Do not try to send anything to websocket here, just exit.
+        raise
+    except Exception as e:
+        print(f"Error calling Groq API: {e}")
